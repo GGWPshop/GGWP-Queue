@@ -10,6 +10,7 @@ services:
       - "${PORT:-8050}:8050"
     networks:
       - ggwp-network
+      - ggwp-gifts_default
     healthcheck:
       test:
         [
@@ -25,4 +26,6 @@ services:
 
 networks:
   ggwp-network:
+    external: true
+  ggwp-gifts_default:
     external: true
