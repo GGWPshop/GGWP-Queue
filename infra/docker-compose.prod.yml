@@ -1,0 +1,51 @@
+services:
+  queue:
+    image: ghcr.io/ggwpshop/ggwp-queue:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: ggwp-queue
+    restart: unless-stopped
+    env_file: ../.env
+    environment:
+      REDIS_URL: ${REDIS_URL:?REDIS_URL is required}
+      SCRAPER_SERVICE_URL: ${SCRAPER_SERVICE_URL:-http://ggwp-scraper-fragment:8020}
+      PORT: ${PORT:-8050}
+      FRAGMENT_SCHEDULER_ENABLED: ${FRAGMENT_SCHEDULER_ENABLED:-true}
+      FRAGMENT_DISCOVER_CRON: ${FRAGMENT_DISCOVER_CRON:-0 0 * * *}
+      FRAGMENT_PRICE_SYNC_CRON: ${FRAGMENT_PRICE_SYNC_CRON:-0 * * * *}
+      FRAGMENT_TIMEZONE: ${FRAGMENT_TIMEZONE:-Europe/Moscow}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      QUEUE_WORKER_ENABLED: ${QUEUE_WORKER_ENABLED:-true}
+      CURRENCY_API_URL: ${CURRENCY_API_URL:-http://ggwp-currency-api:9000}
+      CURRENCY_ADMIN_KEY: ${CURRENCY_ADMIN_KEY:-}
+    ports:
+      - "${PORT:-8050}:8050"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+    networks:
+      - ggwp-network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get('http://127.0.0.1:8050/healthz', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+networks:
+  ggwp-network:
+    external: true
