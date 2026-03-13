@@ -8,7 +8,7 @@ services:
     restart: unless-stopped
     env_file: ../.env
     environment:
-      REDIS_URL: ${REDIS_URL:?REDIS_URL is required}
+      REDIS_URL: ${REDIS_URL:-redis://ggwp-gifts-redis:6379/0}
       SCRAPER_SERVICE_URL: ${SCRAPER_SERVICE_URL:-http://ggwp-scraper-fragment:8020}
       PORT: ${PORT:-8050}
       FRAGMENT_SCHEDULER_ENABLED: ${FRAGMENT_SCHEDULER_ENABLED:-true}
