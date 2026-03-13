@@ -1,383 +1,774 @@
 import {
-  Controller,
-  Get,
-  Post,
-  Delete,
-  Param,
-  Query,
-  Body,
-  HttpCode,
-  HttpStatus,
   BadRequestException,
-  NotFoundException,
+  Body,
+  Controller,
+  DefaultValuePipe,
+  Delete,
+  Get,
+  Param,
+  ParseIntPipe,
+  Post,
+  Query,
 } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import { InjectQueue } from '@nestjs/bullmq';
+import { ConfigService } from '@nestjs/config';
 import { Queue, Job } from 'bullmq';
-import { FRAGMENT_QUEUE, JOB_NAMES, JobName, ScraperJobData } from '../queue/queue.types';
 import { QueueLogBuffer } from '../shared/queue-log-buffer';
-
-// ─── Response shapes (GiftsJob-compatible) ────────────────────────────────────
+import { FRAGMENT_QUEUE } from '../queue/queue.types';
+import type { JobName } from '../queue/queue.types';
+import type { ScraperJobData } from '../queue/queue.types';
+import { previewScheduleRuns } from './schedule-preview';
 
 interface GiftsJobOut {
   id: string;
   job_type: string;
-  status: string;
-  priority: number;
-  run_at: string;
-  attempts: number;
-  max_attempts: number;
-  locked_at: string | null;
-  locked_by: string | null;
-  last_error: string | null;
-  payload: Record<string, unknown> | null;
+  status: 'queued' | 'active' | 'completed' | 'failed' | 'delayed' | 'cancelled';
+  payload: Record<string, unknown>;
   result: Record<string, unknown> | null;
+  progress: unknown;
+  priority: number;
+  max_attempts: number;
+  attempts_made: number;
   created_at: string;
+  updated_at: string;
+  run_at: string | null;
+  locked_at: string | null;
   finished_at: string | null;
+  delay_ms: number;
+  source_trigger: string | null;
+  last_error: string | null;
 }
 
 interface QueueStatsOut {
-  enabled: boolean;
-  running: boolean;
-  concurrency: number;
-  poll_seconds: number;
-  stats: Record<string, unknown>;
+  counts: {
+    waiting: number;
+    active: number;
+    completed: number;
+    failed: number;
+    delayed: number;
+  };
+  health: 'healthy' | 'degraded';
+  queue_enabled: boolean;
+  queue_running: boolean;
+  queue_concurrency: number;
+  queue_poll_seconds: number;
+}
+
+interface QueueMonitoringOut {
+  paused: boolean;
+  sample_size: number;
+  queue_counts: QueueStatsOut['counts'];
+  sample_counts: Record<GiftsJobOut['status'], number>;
+  success_rate: number | null;
+  avg_duration_ms: number | null;
+  avg_queue_wait_ms: number | null;
+  completed_last_hour: number;
+  failed_last_hour: number;
+  stale_active: number;
+  delayed_over_15m: number;
+  oldest_active_ms: number | null;
+  oldest_delayed_ms: number | null;
+  schedules_total: number;
+  overdue_schedules: number;
+  next_schedule_at: string | null;
+}
+
+interface BatchJobRequest {
+  action: 'cancel' | 'requeue' | 'promote';
+  ids: string[];
+}
+
+interface BatchJobResultOut {
+  id: string;
+  ok: boolean;
+  message: string;
+}
+
+interface RepeatableJobOut {
+  key: string;
+  name: string;
+  pattern?: string | null;
+  every?: number | null;
+  tz?: string | null;
+  next?: number | null;
+  next_runs: string[];
 }
 
 interface FragmentScheduleOut {
   id: string;
   title: string;
   description: string;
-  job_type: string;
-  mode: 'discover' | 'price_sync';
+  mode: 'discover' | 'price_sync' | 'sold_scan';
   enabled: boolean;
-  cron: string;
-  timezone: string;
+  job_type: string;
+  schedule_key: string;
+  cron: string | null;
+  interval_ms: number | null;
+  timezone: string | null;
   next_run_at: string | null;
+  next_runs: string[];
   last_job: GiftsJobOut | null;
 }
 
-// ─── Schedule metadata ────────────────────────────────────────────────────────
+function inferMode(jobType: string, requestedMode?: string): ScraperJobData['mode'] {
+  if (requestedMode === 'price_sync' || requestedMode === 'sold_scan' || requestedMode === 'discover') {
+    return requestedMode;
+  }
+  if (jobType.includes('price_sync')) return 'price_sync';
+  if (jobType.includes('sold_scan')) return 'sold_scan';
+  return 'discover';
+}
 
-const SCHEDULE_META: Record<string, { id: string; title: string; description: string; mode: 'discover' | 'price_sync' }> = {
-  [JOB_NAMES.DISCOVER]: {
-    id: 'fragment-discovery',
-    title: 'Fragment Catalog Discovery',
-    description: 'Полное обновление каталога Fragment (запускается раз в сутки)',
-    mode: 'discover',
-  },
-  [JOB_NAMES.PRICE_SYNC]: {
-    id: 'fragment-price-sync',
-    title: 'Fragment Price Sync',
-    description: 'Синхронизация цен каталога Fragment (запускается ежечасно)',
-    mode: 'price_sync',
-  },
-};
-
-const STATE_TO_PYTHON: Record<string, string> = {
-  waiting: 'queued',
-  active: 'active',
-  completed: 'completed',
-  failed: 'failed',
-  delayed: 'delayed',
-  paused: 'queued',
-  unknown: 'queued',
-};
-
-const PYTHON_TO_BULLMQ: Record<string, string[]> = {
-  queued: ['waiting', 'paused'],
-  active: ['active'],
-  running: ['active'],
-  completed: ['completed'],
-  failed: ['failed'],
-  delayed: ['delayed'],
-  cancelled: [],
-};
-
-const MODE_FROM_JOB_TYPE: Record<string, ScraperJobData['mode']> = {
-  [JOB_NAMES.DISCOVER]: 'discover',
-  [JOB_NAMES.PRICE_SYNC]: 'price_sync',
-  [JOB_NAMES.SOLD_SCAN]: 'sold_scan',
-};
-
-// ─── Controller ───────────────────────────────────────────────────────────────
+function toIsoOrNull(value?: number | null): string | null {
+  if (typeof value !== 'number' || Number.isNaN(value)) return null;
+  try {
+    return new Date(value).toISOString();
+  } catch {
+    return null;
+  }
+}
 
 @Controller('admin')
 export class AdminController {
   constructor(
-    @InjectQueue(FRAGMENT_QUEUE) private readonly queue: Queue<ScraperJobData>,
-    private readonly cfg: ConfigService,
+    private readonly configService: ConfigService,
     private readonly logBuffer: QueueLogBuffer,
+    @InjectQueue(FRAGMENT_QUEUE) private readonly queue: Queue<ScraperJobData>,
   ) {}
-
-  // ─── Queue Stats ────────────────────────────────────────────────────────────
 
   @Get('queue/stats')
   async getQueueStats(): Promise<QueueStatsOut> {
-    const [counts, isPaused] = await Promise.all([
-      this.queue.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed', 'paused'),
-      this.queue.isPaused(),
-    ]);
+    const counts = await this.queue.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed');
+    const paused = await this.queue.isPaused();
+    const schedulerEnabled = this.configService.get<string>('FRAGMENT_SCHEDULER_ENABLED', 'true') === 'true';
+    const health: QueueStatsOut['health'] = (counts.failed ?? 0) >= 5 ? 'degraded' : 'healthy';
     return {
-      enabled: this.cfg.get<string>('QUEUE_WORKER_ENABLED', 'true') === 'true',
-      running: !isPaused,
-      concurrency: parseInt(this.cfg.get<string>('WORKER_CONCURRENCY', '2')),
-      poll_seconds: 0,
-      stats: {
+      counts: {
         waiting: counts.waiting ?? 0,
         active: counts.active ?? 0,
         completed: counts.completed ?? 0,
         failed: counts.failed ?? 0,
         delayed: counts.delayed ?? 0,
       },
+      health,
+      queue_enabled: schedulerEnabled,
+      queue_running: !paused,
+      queue_concurrency: 2,
+      queue_poll_seconds: 0,
     };
   }
 
-  // ─── Jobs ────────────────────────────────────────────────────────────────────
+  @Get('queue/monitoring')
+  async getQueueMonitoring(
+    @Query('limit', new DefaultValuePipe(200), ParseIntPipe) limit: number,
+  ): Promise<QueueMonitoringOut> {
+    const sampleLimit = Math.min(Math.max(limit, 50), 500);
+    const [counts, paused, repeatableJobs, jobs] = await Promise.all([
+      this.queue.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed'),
+      this.queue.isPaused(),
+      this.queue.getRepeatableJobs(),
+      this.queue.getJobs(['active', 'waiting', 'delayed', 'failed', 'completed'], 0, sampleLimit - 1, true),
+    ]);
+
+    const sample = await Promise.all(jobs.map((job) => this.toGiftsJob(job)));
+    const now = Date.now();
+    const oneHourAgo = now - 60 * 60 * 1000;
+
+    const sampleCounts: Record<GiftsJobOut['status'], number> = {
+      queued: 0,
+      active: 0,
+      completed: 0,
+      failed: 0,
+      delayed: 0,
+      cancelled: 0,
+    };
+
+    let durationTotal = 0;
+    let durationCount = 0;
+    let queueWaitTotal = 0;
+    let queueWaitCount = 0;
+    let staleActive = 0;
+    let delayedOver15m = 0;
+    let oldestActiveMs: number | null = null;
+    let oldestDelayedMs: number | null = null;
+    let completedLastHour = 0;
+    let failedLastHour = 0;
+
+    for (const job of sample) {
+      sampleCounts[job.status] += 1;
+
+      if (job.locked_at) {
+        const waitMs = new Date(job.locked_at).getTime() - new Date(job.created_at).getTime();
+        if (waitMs >= 0) {
+          queueWaitTotal += waitMs;
+          queueWaitCount += 1;
+        }
+      }
+
+      if (job.finished_at) {
+        const finishedAt = new Date(job.finished_at).getTime();
+        const startedAt = new Date(job.locked_at ?? job.created_at).getTime();
+        const durationMs = finishedAt - startedAt;
+        if (durationMs >= 0) {
+          durationTotal += durationMs;
+          durationCount += 1;
+        }
+
+        if (job.status === 'completed' && finishedAt >= oneHourAgo) {
+          completedLastHour += 1;
+        }
+        if (job.status === 'failed' && finishedAt >= oneHourAgo) {
+          failedLastHour += 1;
+        }
+      }
+
+      if (job.status === 'active' && job.locked_at) {
+        const activeAge = now - new Date(job.locked_at).getTime();
+        if (activeAge >= 15 * 60 * 1000) {
+          staleActive += 1;
+        }
+        oldestActiveMs = oldestActiveMs === null ? activeAge : Math.max(oldestActiveMs, activeAge);
+      }
+
+      if (job.status === 'delayed' && job.run_at) {
+        const delayedAge = now - new Date(job.run_at).getTime();
+        if (delayedAge >= 15 * 60 * 1000) {
+          delayedOver15m += 1;
+        }
+        oldestDelayedMs = oldestDelayedMs === null ? delayedAge : Math.max(oldestDelayedMs, delayedAge);
+      }
+    }
+
+    const successfulSample = sampleCounts.completed;
+    const terminalSample = sampleCounts.completed + sampleCounts.failed;
+    const successRate = terminalSample > 0 ? successfulSample / terminalSample : null;
+
+    const schedulePreview = repeatableJobs
+      .map((job) => this.toRepeatableJob(job))
+      .filter((job) => typeof job.next === 'number')
+      .sort((left, right) => (left.next ?? 0) - (right.next ?? 0));
+
+    const overdueSchedules = schedulePreview.filter((job) => (job.next ?? 0) < now - 60_000).length;
+    const nextScheduleAt = schedulePreview[0]?.next ? new Date(schedulePreview[0].next as number).toISOString() : null;
+
+    return {
+      paused,
+      sample_size: sample.length,
+      queue_counts: {
+        waiting: counts.waiting ?? 0,
+        active: counts.active ?? 0,
+        completed: counts.completed ?? 0,
+        failed: counts.failed ?? 0,
+        delayed: counts.delayed ?? 0,
+      },
+      sample_counts: sampleCounts,
+      success_rate: successRate,
+      avg_duration_ms: durationCount > 0 ? Math.round(durationTotal / durationCount) : null,
+      avg_queue_wait_ms: queueWaitCount > 0 ? Math.round(queueWaitTotal / queueWaitCount) : null,
+      completed_last_hour: completedLastHour,
+      failed_last_hour: failedLastHour,
+      stale_active: staleActive,
+      delayed_over_15m: delayedOver15m,
+      oldest_active_ms: oldestActiveMs,
+      oldest_delayed_ms: oldestDelayedMs,
+      schedules_total: repeatableJobs.length,
+      overdue_schedules: overdueSchedules,
+      next_schedule_at: nextScheduleAt,
+    };
+  }
 
   @Get('jobs')
   async getJobs(
     @Query('status') status?: string,
-    @Query('job_type') jobType?: string,
-    @Query('limit') limitStr?: string,
+    @Query('limit') limit?: string,
   ): Promise<GiftsJobOut[]> {
-    const limit = Math.min(200, Math.max(1, parseInt(limitStr ?? '50') || 50));
+    const normalizedLimit = limit ? Math.min(Math.max(parseInt(limit, 10) || 0, 1), 500) : 200;
+    const statuses = status ? status.split(',').map((value) => value.trim()).filter(Boolean) : undefined;
 
-    let bullmqStates: string[];
-    if (status && status in PYTHON_TO_BULLMQ) {
-      bullmqStates = PYTHON_TO_BULLMQ[status];
-    } else if (status) {
-      bullmqStates = [status];
-    } else {
-      bullmqStates = ['waiting', 'active', 'completed', 'failed', 'delayed', 'paused'];
-    }
+    const bullStatuses = (statuses?.length ? statuses : ['active', 'waiting', 'delayed', 'failed', 'completed'])
+      .filter((value): value is 'waiting' | 'active' | 'completed' | 'failed' | 'delayed' => (
+        value === 'waiting'
+        || value === 'active'
+        || value === 'completed'
+        || value === 'failed'
+        || value === 'delayed'
+      ));
 
-    if (bullmqStates.length === 0) return [];
-
-    const jobs: Job[] = await this.queue.getJobs(bullmqStates as any[], 0, limit - 1);
-    const filtered = jobType ? jobs.filter((j) => j.name === jobType) : jobs;
-
-    return Promise.all(filtered.map((j) => this.toGiftsJob(j)));
+    const jobs = await this.queue.getJobs(bullStatuses, 0, normalizedLimit - 1, true);
+    return Promise.all(jobs.map((job) => this.toGiftsJob(job)));
   }
 
-  @Post('jobs/:id/cancel')
-  @HttpCode(HttpStatus.OK)
-  async cancelJob(@Param('id') id: string) {
+  @Get('jobs/:id')
+  async getJob(@Param('id') id: string): Promise<GiftsJobOut> {
     const job = await this.queue.getJob(id);
-    if (!job) throw new NotFoundException(`Job ${id} not found`);
-    const state = await job.getState();
-    if (state === 'active') {
-      await job.discard();
-    } else {
-      await job.remove();
+    if (!job) {
+      throw new BadRequestException('Job not found');
     }
-    return { ok: true, id };
-  }
-
-  @Post('jobs/:id/requeue')
-  @HttpCode(HttpStatus.OK)
-  async requeueJob(@Param('id') id: string) {
-    const job = await this.queue.getJob(id);
-    if (!job) throw new NotFoundException(`Job ${id} not found`);
-    await job.retry();
-    return { ok: true, id };
-  }
-
-  @Post('jobs/enqueue')
-  async enqueueJob(
-    @Body() body: { job_type: string; payload?: Record<string, unknown>; priority?: number; max_attempts?: number },
-  ): Promise<GiftsJobOut> {
-    const { job_type, payload, priority, max_attempts } = body;
-
-    const mode: ScraperJobData['mode'] =
-      (payload?.mode as ScraperJobData['mode']) ?? MODE_FROM_JOB_TYPE[job_type];
-    if (!mode) {
-      throw new BadRequestException(`Unknown job_type: ${job_type}`);
-    }
-
-    const job = await this.queue.add(
-      job_type as JobName,
-      { mode, trigger: 'api' },
-      {
-        priority,
-        attempts: max_attempts ?? 5,
-        backoff: { type: 'exponential', delay: 30_000 },
-        removeOnComplete: { count: 500, age: 7 * 24 * 3600 },
-        removeOnFail: { count: 200, age: 30 * 24 * 3600 },
-      },
-    );
     return this.toGiftsJob(job);
   }
 
-  // ─── Queue Control ──────────────────────────────────────────────────────────
-
-  @Post('queue/pause')
-  @HttpCode(HttpStatus.OK)
-  async pauseQueue() {
-    await this.queue.pause();
-    this.logBuffer.push({ level: 'warn', source: 'admin', message: 'Queue paused via admin API' });
-    return { ok: true, paused: true };
+  @Post('jobs/:id/cancel')
+  async cancelJob(@Param('id') id: string): Promise<{ ok: boolean }> {
+    const job = await this.queue.getJob(id);
+    if (!job) throw new BadRequestException('Job not found');
+    await job.remove();
+    this.logBuffer.push({
+      level: 'warn',
+      source: 'admin',
+      message: `Job removed from queue`,
+      jobId: id,
+      jobName: job.name,
+    });
+    return { ok: true };
   }
 
-  @Post('queue/resume')
-  @HttpCode(HttpStatus.OK)
-  async resumeQueue() {
-    await this.queue.resume();
-    this.logBuffer.push({ level: 'info', source: 'admin', message: 'Queue resumed via admin API' });
-    return { ok: true, paused: false };
-  }
-
-  @Delete('jobs/failed')
-  @HttpCode(HttpStatus.OK)
-  async clearFailedJobs() {
-    await this.queue.clean(0, 10_000, 'failed');
-    this.logBuffer.push({ level: 'warn', source: 'admin', message: 'All failed jobs cleared' });
+  @Post('jobs/:id/requeue')
+  async requeueJob(@Param('id') id: string): Promise<{ ok: boolean }> {
+    const job = await this.queue.getJob(id);
+    if (!job) throw new BadRequestException('Job not found');
+    await job.retry();
+    this.logBuffer.push({
+      level: 'info',
+      source: 'admin',
+      message: `Job retried`,
+      jobId: id,
+      jobName: job.name,
+    });
     return { ok: true };
   }
 
   @Post('jobs/:id/promote')
-  @HttpCode(HttpStatus.OK)
-  async promoteJob(@Param('id') id: string) {
+  async promoteJob(@Param('id') id: string): Promise<{ ok: boolean }> {
     const job = await this.queue.getJob(id);
-    if (!job) throw new NotFoundException(`Job ${id} not found`);
+    if (!job) throw new BadRequestException('Job not found');
     await job.promote();
-    return { ok: true, id };
+    this.logBuffer.push({
+      level: 'info',
+      source: 'admin',
+      message: `Delayed job promoted`,
+      jobId: id,
+      jobName: job.name,
+    });
+    return { ok: true };
   }
 
-  // ─── Repeatable Jobs ────────────────────────────────────────────────────────
+  @Post('jobs/batch')
+  async batchJobs(@Body() body: BatchJobRequest): Promise<{
+    action: BatchJobRequest['action'];
+    total: number;
+    success_count: number;
+    failed_count: number;
+    results: BatchJobResultOut[];
+  }> {
+    if (!body || !Array.isArray(body.ids)) {
+      throw new BadRequestException('ids[] is required');
+    }
+    if (!['cancel', 'requeue', 'promote'].includes(body.action)) {
+      throw new BadRequestException('Unsupported batch action');
+    }
+
+    const ids = Array.from(new Set(body.ids.map((id) => String(id).trim()).filter(Boolean))).slice(0, 100);
+    if (ids.length === 0) {
+      throw new BadRequestException('At least one job id is required');
+    }
+
+    const results: BatchJobResultOut[] = [];
+    for (const id of ids) {
+      const job = await this.queue.getJob(id);
+      if (!job) {
+        results.push({ id, ok: false, message: 'Job not found' });
+        continue;
+      }
+
+      try {
+        if (body.action === 'cancel') {
+          await job.remove();
+          this.logBuffer.push({
+            level: 'warn',
+            source: 'admin',
+            message: `Batch cancel`,
+            jobId: id,
+            jobName: job.name,
+          });
+        } else if (body.action === 'requeue') {
+          await job.retry();
+          this.logBuffer.push({
+            level: 'info',
+            source: 'admin',
+            message: `Batch retry`,
+            jobId: id,
+            jobName: job.name,
+          });
+        } else {
+          await job.promote();
+          this.logBuffer.push({
+            level: 'info',
+            source: 'admin',
+            message: `Batch promote`,
+            jobId: id,
+            jobName: job.name,
+          });
+        }
+
+        results.push({ id, ok: true, message: 'ok' });
+      } catch (error) {
+        results.push({
+          id,
+          ok: false,
+          message: error instanceof Error ? error.message : 'Unexpected error',
+        });
+      }
+    }
+
+    const successCount = results.filter((result) => result.ok).length;
+    return {
+      action: body.action,
+      total: ids.length,
+      success_count: successCount,
+      failed_count: ids.length - successCount,
+      results,
+    };
+  }
+
+  @Delete('jobs/failed')
+  async clearFailedJobs(): Promise<{ ok: boolean }> {
+    await this.queue.clean(0, 1000, 'failed');
+    this.logBuffer.push({
+      level: 'warn',
+      source: 'admin',
+      message: 'Failed jobs cleaned',
+    });
+    return { ok: true };
+  }
+
+  @Post('jobs')
+  @Post('jobs/enqueue')
+  async enqueueJob(@Body() body: {
+    job_type: string;
+    payload?: Record<string, unknown>;
+    priority?: number;
+    max_attempts?: number;
+    backoff_delay_ms?: number;
+    run_at?: string;
+  }): Promise<GiftsJobOut> {
+    const {
+      job_type,
+      payload,
+      priority,
+      max_attempts,
+      backoff_delay_ms,
+      run_at,
+    } = body ?? {};
+
+    if (!job_type) throw new BadRequestException('job_type is required');
+
+    const mode = inferMode(job_type, typeof payload?.mode === 'string' ? payload.mode : undefined);
+
+    let delayMs: number | undefined;
+    if (run_at) {
+      const runAtMs = new Date(run_at).getTime();
+      if (Number.isNaN(runAtMs)) {
+        throw new BadRequestException('run_at must be a valid ISO date');
+      }
+      delayMs = Math.max(0, runAtMs - Date.now());
+    }
+
+    const job = await this.queue.add(
+      job_type as JobName,
+      {
+        ...(payload ?? {}),
+        mode,
+        trigger: 'api',
+      } as ScraperJobData,
+      {
+        priority,
+        delay: delayMs,
+        attempts: max_attempts ?? 5,
+        backoff: {
+          type: 'exponential',
+          delay: backoff_delay_ms ?? 30_000,
+        },
+        removeOnComplete: { count: 100 },
+        removeOnFail: { count: 200 },
+      },
+    );
+
+    this.logBuffer.push({
+      level: 'info',
+      source: 'admin',
+      message: `Job enqueued`,
+      jobId: String(job.id),
+      jobName: job.name,
+    });
+
+    return this.toGiftsJob(job);
+  }
 
   @Get('jobs/repeatable')
-  async getRepeatableJobs() {
+  async getRepeatableJobs(): Promise<RepeatableJobOut[]> {
     const jobs = await this.queue.getRepeatableJobs();
-    return jobs.map((j) => ({
-      key: j.key,
-      name: j.name,
-      pattern: j.pattern ?? null,
-      every: j.every ?? null,
-      tz: j.tz ?? null,
-      next: j.next ? new Date(j.next).toISOString() : null,
-    }));
+    return jobs.map((job) => this.toRepeatableJob(job));
+  }
+
+  @Get('jobs/repeatable/preview')
+  getRepeatablePreview(
+    @Query('pattern') pattern?: string,
+    @Query('every') every?: string,
+    @Query('timezone') timezone?: string,
+    @Query('count', new DefaultValuePipe(5), ParseIntPipe) count = 5,
+  ): { runs: string[] } {
+    const interval = every ? parseInt(every, 10) : undefined;
+    const runs = previewScheduleRuns({
+      pattern,
+      every: Number.isFinite(interval) ? interval : undefined,
+      timezone,
+      count,
+    });
+    return { runs };
   }
 
   @Post('jobs/repeatable')
-  async addRepeatableJob(
-    @Body() body: {
-      name: string;
-      pattern?: string;
-      every?: number;
-      timezone?: string;
-      attempts?: number;
-      payload?: Record<string, unknown>;
-    },
-  ) {
-    const { name, pattern, every, timezone, attempts, payload } = body;
-    if (!pattern && !every) {
-      throw new BadRequestException('Either pattern (cron) or every (ms) is required');
+  async addRepeatableJob(@Body() body: {
+    name: string;
+    pattern?: string;
+    every?: number;
+    tz?: string;
+    mode?: 'discover' | 'price_sync' | 'sold_scan';
+    attempts?: number;
+    priority?: number;
+    backoff_delay_ms?: number;
+    payload?: Record<string, unknown>;
+  }): Promise<{ ok: boolean }> {
+    const {
+      name,
+      pattern,
+      every,
+      tz,
+      mode,
+      attempts = 3,
+      priority,
+      backoff_delay_ms,
+      payload,
+    } = body ?? {};
+
+    if (!name) throw new BadRequestException('name is required');
+    if (!pattern && !every) throw new BadRequestException('pattern or every is required');
+
+    if (pattern) {
+      previewScheduleRuns({ pattern, timezone: tz, count: 1 });
     }
-    const mode: ScraperJobData['mode'] = (payload?.mode as ScraperJobData['mode']) ?? MODE_FROM_JOB_TYPE[name];
-    if (!mode) {
-      throw new BadRequestException(`Unknown job name: ${name}. Must be one of: ${Object.keys(MODE_FROM_JOB_TYPE).join(', ')}`);
+    if (every !== undefined && every <= 0) {
+      throw new BadRequestException('every must be greater than 0');
     }
 
-    const repeatOpts: any = {};
-    if (pattern) { repeatOpts.pattern = pattern; if (timezone) repeatOpts.tz = timezone; }
-    if (every) repeatOpts.every = every;
-
-    const job = await this.queue.add(
+    await this.queue.add(
       name as JobName,
-      { mode, trigger: 'scheduler' },
       {
-        repeat: repeatOpts,
-        attempts: attempts ?? 3,
-        backoff: { type: 'exponential', delay: 30_000 },
-        removeOnComplete: { count: 500, age: 7 * 24 * 3600 },
-        removeOnFail: { count: 200, age: 30 * 24 * 3600 },
+        ...(payload ?? {}),
+        mode: inferMode(name, mode),
+        trigger: 'scheduler',
+      } as ScraperJobData,
+      {
+        repeat: {
+          pattern,
+          every,
+          tz,
+        },
+        attempts,
+        priority,
+        backoff: {
+          type: 'exponential',
+          delay: backoff_delay_ms ?? 30_000,
+        },
+        removeOnComplete: { count: 100 },
+        removeOnFail: { count: 200 },
       },
     );
-    this.logBuffer.push({ level: 'info', source: 'admin', message: `Added repeatable job: ${name}`, jobName: name });
-    return { ok: true, id: job.id };
+
+    this.logBuffer.push({
+      level: 'info',
+      source: 'admin',
+      message: `Repeatable job added`,
+      jobName: name,
+    });
+
+    return { ok: true };
   }
 
   @Delete('jobs/repeatable/:key')
-  @HttpCode(HttpStatus.OK)
-  async removeRepeatableJob(@Param('key') key: string) {
-    const removed = await this.queue.removeRepeatableByKey(decodeURIComponent(key));
-    if (!removed) throw new NotFoundException(`Repeatable job key not found: ${key}`);
-    this.logBuffer.push({ level: 'warn', source: 'admin', message: `Removed repeatable job key: ${key}` });
-    return { ok: true, key };
+  async removeRepeatableJob(@Param('key') key: string): Promise<{ ok: boolean }> {
+    await this.queue.removeRepeatableByKey(key);
+    this.logBuffer.push({
+      level: 'warn',
+      source: 'admin',
+      message: `Repeatable job removed`,
+    });
+    return { ok: true };
   }
 
-  // ─── Logs ────────────────────────────────────────────────────────────────────
-
   @Get('logs')
-  getLogs(@Query('limit') limitStr?: string) {
-    const limit = Math.min(300, Math.max(1, parseInt(limitStr ?? '100') || 100));
-    return this.logBuffer.getLast(limit);
+  getLogs(@Query('limit') limit?: string) {
+    const max = limit ? Math.max(parseInt(limit, 10) || 100, 1) : 100;
+    return this.logBuffer.getLast(max);
   }
 
   @Delete('logs')
-  @HttpCode(HttpStatus.OK)
-  clearLogs() {
+  clearLogs(): { ok: boolean } {
     this.logBuffer.clear();
     return { ok: true };
   }
 
-  // ─── Fragment Schedules ────────────────────────────────────────────────────
-
   @Get('fragment/schedules')
   async getFragmentSchedules(): Promise<FragmentScheduleOut[]> {
-    const [repeatableJobs, completedJobs, failedJobs] = await Promise.all([
-      this.queue.getRepeatableJobs(),
-      this.queue.getJobs(['completed'] as any[], 0, 49),
-      this.queue.getJobs(['failed'] as any[], 0, 49),
-    ]);
+    const schedulerEnabled = this.configService.get<string>('FRAGMENT_SCHEDULER_ENABLED', 'true') === 'true';
+    const discoveryCron = this.configService.get<string>('FRAGMENT_DISCOVER_CRON', '0 0 * * *');
+    const priceSyncCron = this.configService.get<string>('FRAGMENT_PRICE_SYNC_CRON', '0 * * * *');
+    const timezone = this.configService.get<string>('FRAGMENT_TIMEZONE', process.env.TZ ?? 'UTC');
+    const repeatables = await this.queue.getRepeatableJobs();
+    const jobs = await this.queue.getJobs(['delayed', 'waiting', 'active', 'completed', 'failed'], 0, 200, true);
+    const mappedJobs = await Promise.all(jobs.map((job) => this.toGiftsJob(job)));
 
-    const allRecentJobs = [...completedJobs, ...failedJobs];
+    const scheduleDefs = [
+      {
+        id: 'fragment-discovery',
+        title: 'Fragment Discovery',
+        description: 'Полный discovery-run каталога Telegram Gifts из Fragment.',
+        mode: 'discover' as const,
+        enabled: schedulerEnabled,
+        job_type: 'fragment.catalog.discover',
+        schedule_key: 'fragment_discovery',
+        cron: discoveryCron ?? null,
+        interval_ms: null,
+        timezone,
+      },
+      {
+        id: 'fragment-price-sync',
+        title: 'Fragment Price Sync',
+        description: 'Почасовая синхронизация цен Telegram Gifts из Fragment в каталог GGWP Gifts.',
+        mode: 'price_sync' as const,
+        enabled: schedulerEnabled,
+        job_type: 'fragment.catalog.price_sync',
+        schedule_key: 'fragment_price_sync',
+        cron: priceSyncCron ?? null,
+        interval_ms: null,
+        timezone,
+      },
+    ];
 
-    const result: FragmentScheduleOut[] = [];
+    return scheduleDefs.map((definition) => {
+      const repeatable = repeatables.find((job) => job.name === definition.job_type);
+      const repeatableEvery = typeof repeatable?.every === 'string'
+        ? parseInt(repeatable.every, 10)
+        : repeatable?.every ?? null;
+      const lastJob = mappedJobs.find((job) => job.job_type === definition.job_type);
+      const nextRunAt = repeatable?.next ? new Date(repeatable.next).toISOString() : null;
+      const nextRuns = repeatable
+        ? this.getPreviewRuns({
+            pattern: repeatable.pattern,
+            every: repeatableEvery,
+            timezone: repeatable.tz ?? definition.timezone,
+          })
+        : this.getPreviewRuns({
+            pattern: definition.cron,
+            every: definition.interval_ms,
+            timezone: definition.timezone,
+          });
 
-    for (const [jobName, meta] of Object.entries(SCHEDULE_META)) {
-      const repeatable = repeatableJobs.find((r) => r.name === jobName);
-      const lastJob = allRecentJobs
-        .filter((j) => j.name === jobName)
-        .sort((a, b) => (b.finishedOn ?? b.timestamp) - (a.finishedOn ?? a.timestamp))[0];
-
-      result.push({
-        id: meta.id,
-        title: meta.title,
-        description: meta.description,
-        job_type: jobName,
-        mode: meta.mode,
-        enabled: repeatable !== undefined,
-        cron: repeatable?.pattern ?? '',
-        timezone: repeatable?.tz ?? this.cfg.get<string>('FRAGMENT_TIMEZONE', 'Europe/Moscow'),
-        next_run_at: repeatable?.next ? new Date(repeatable.next).toISOString() : null,
-        last_job: lastJob ? await this.toGiftsJob(lastJob) : null,
-      });
-    }
-
-    return result;
+      return {
+        ...definition,
+        next_run_at: nextRunAt,
+        next_runs: nextRuns,
+        last_job: lastJob ?? null,
+      };
+    });
   }
 
-  // ─── Private helpers ────────────────────────────────────────────────────────
-
-  private async toGiftsJob(job: Job): Promise<GiftsJobOut> {
-    const state = await job.getState();
+  private toRepeatableJob(job: {
+    key: string;
+    name: string;
+    pattern?: string | null;
+    every?: number | string | null;
+    tz?: string | null;
+    next?: number | null;
+  }): RepeatableJobOut {
+    const every = typeof job.every === 'string' ? parseInt(job.every, 10) : job.every ?? null;
     return {
-      id: job.id as string,
+      key: job.key,
+      name: job.name,
+      pattern: job.pattern,
+      every,
+      tz: job.tz,
+      next: job.next,
+      next_runs: this.getPreviewRuns({
+        pattern: job.pattern,
+        every,
+        timezone: job.tz ?? process.env.TZ ?? 'UTC',
+      }),
+    };
+  }
+
+  private getPreviewRuns(options: {
+    pattern?: string | null;
+    every?: number | null;
+    timezone?: string | null;
+  }): string[] {
+    try {
+      return previewScheduleRuns({
+        pattern: options.pattern,
+        every: options.every,
+        timezone: options.timezone,
+        count: 5,
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  private async toGiftsJob(job: Job<ScraperJobData>): Promise<GiftsJobOut> {
+    const state = await job.getState();
+    const status: GiftsJobOut['status'] =
+      state === 'completed'
+        ? 'completed'
+        : state === 'failed'
+          ? 'failed'
+          : state === 'active'
+            ? 'active'
+            : state === 'delayed'
+              ? 'delayed'
+              : state === 'waiting' || state === 'waiting-children' || state === 'prioritized'
+                ? 'queued'
+                : 'cancelled';
+
+    const updatedAtMs = Math.max(
+      job.finishedOn ?? 0,
+      job.processedOn ?? 0,
+      job.timestamp ?? 0,
+    );
+    const delayMs = job.opts.delay ?? 0;
+    const createdAt = toIsoOrNull(job.timestamp) ?? new Date().toISOString();
+    const updatedAt = toIsoOrNull(updatedAtMs || job.timestamp) ?? createdAt;
+    const runAt = typeof job.timestamp === 'number' && !Number.isNaN(job.timestamp)
+      ? toIsoOrNull(job.timestamp + delayMs)
+      : null;
+
+    return {
+      id: String(job.id),
       job_type: job.name,
-      status: STATE_TO_PYTHON[state] ?? state,
-      priority: (job.opts as any)?.priority ?? 0,
-      run_at: new Date(job.timestamp).toISOString(),
-      attempts: job.attemptsMade,
-      max_attempts: (job.opts as any)?.attempts ?? 5,
-      locked_at: job.processedOn ? new Date(job.processedOn).toISOString() : null,
-      locked_by: null,
+      status,
+      payload: (job.data ?? {}) as Record<string, unknown>,
+      result: (job.returnvalue as Record<string, unknown> | null) ?? null,
+      progress: job.progress ?? null,
+      priority: job.opts.priority ?? 0,
+      max_attempts: job.opts.attempts ?? 1,
+      attempts_made: job.attemptsMade ?? 0,
+      created_at: createdAt,
+      updated_at: updatedAt,
+      run_at: runAt,
+      locked_at: toIsoOrNull(job.processedOn),
+      finished_at: toIsoOrNull(job.finishedOn),
+      delay_ms: delayMs,
+      source_trigger: typeof job.data?.trigger === 'string' ? job.data.trigger : null,
       last_error: job.failedReason ?? null,
-      payload: job.data as Record<string, unknown>,
-      result: (job.returnvalue as Record<string, unknown>) ?? null,
-      created_at: new Date(job.timestamp).toISOString(),
-      finished_at: job.finishedOn ? new Date(job.finishedOn).toISOString() : null,
     };
   }
 }

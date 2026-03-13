@@ -11,6 +11,7 @@ export type JobName = (typeof JOB_NAMES)[keyof typeof JOB_NAMES];
 export interface ScraperJobData {
   mode: 'discover' | 'price_sync' | 'sold_scan';
   trigger?: 'scheduler' | 'api';
+  [key: string]: unknown;
 }
 
 export interface ScraperJobResult {
